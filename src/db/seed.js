@@ -1,41 +1,31 @@
 import bcrypt from 'bcryptjs';
-import { db } from './index.js';
-import { env } from '../config/env.js';
-import { newId } from '../utils/id.js';
+import { supabase } from '../config/supabase.js';
+import 'dotenv/config';
 
-const DEFAULT_CATEGORIES = [
-  { id: 'electronics', label: 'Electronics & Phones', icon: 'Smartphone', color: '#0284C7' },
-  { id: 'wallets', label: 'Wallets & IDs', icon: 'Wallet', color: '#8B5CF6' },
-  { id: 'pets', label: 'Lost Pets', icon: 'Dog', color: '#F59E0B' },
-  { id: 'keys', label: 'Keys & Keyfobs', icon: 'Key', color: '#10B981' },
-  { id: 'bags', label: 'Bags & Luggage', icon: 'Briefcase', color: '#EC4899' },
-  { id: 'documents', label: 'Passports & Cards', icon: 'FileText', color: '#6366F1' },
-  { id: 'jewelry', label: 'Jewelry & Watches', icon: 'Watch', color: '#F43F5E' },
-  { id: 'clothing', label: 'Apparel & Wearables', icon: 'Shirt', color: '#14B8A6' },
-  { id: 'other', label: 'Other', icon: 'Package', color: '#64748B' },
-];
-
-function seedAdmin() {
-  const existing = db.prepare('SELECT id FROM admins WHERE email = ?').get(env.adminSeed.email);
-  if (existing) {
-    console.log(`[seed] Admin already exists: ${env.adminSeed.email}`);
-    return;
-  }
-  const passwordHash = bcrypt.hashSync(env.adminSeed.password, 10);
-  db.prepare(
-    'INSERT INTO admins (id, name, email, password_hash, role) VALUES (?, ?, ?, ?, ?)'
-  ).run(newId('ADM'), env.adminSeed.name, env.adminSeed.email, passwordHash, 'super_admin');
-  console.log(`[seed] Created admin ${env.adminSeed.email} / ${env.adminSeed.password}`);
+const email = process.env.ADMIN_SEED_EMAIL;
+const password = process.env.ADMIN_SEED_PASSWORD;
+const name = process.env.ADMIN_SEED_NAME || 'BackToOwner Admin';
+if (!email || !password) {
+  console.error('Set ADMIN_SEED_EMAIL and ADMIN_SEED_PASSWORD in .env before running npm run seed.');
+  process.exit(1);
 }
-
-function seedCategories() {
-  const insert = db.prepare(
-    'INSERT OR IGNORE INTO categories (id, label, icon, color) VALUES (?, ?, ?, ?)'
-  );
-  for (const c of DEFAULT_CATEGORIES) insert.run(c.id, c.label, c.icon, c.color);
-  console.log(`[seed] Ensured ${DEFAULT_CATEGORIES.length} default categories`);
+if (password.length < 12) {
+  console.error('ADMIN_SEED_PASSWORD must be at least 12 characters.');
+  process.exit(1);
 }
-
-seedAdmin();
-seedCategories();
-console.log('[seed] Done.');
+const normalizedEmail = email.toLowerCase().trim();
+const { data: existing, error: lookupError } = await supabase.from('admins').select('id').eq('email', normalizedEmail).maybeSingle();
+if (lookupError) throw lookupError;
+if (existing) {
+  console.log(`Admin ${normalizedEmail} already exists; no changes made.`);
+  process.exit(0);
+}
+const { error } = await supabase.from('admins').insert({
+  id: `ADM${Date.now().toString(36).toUpperCase()}`,
+  name,
+  email: normalizedEmail,
+  password_hash: await bcrypt.hash(password, 12),
+  role: 'admin',
+});
+if (error) throw error;
+console.log(`Created admin account for ${normalizedEmail}.`);

@@ -6,11 +6,8 @@ export const env = {
   nodeEnv:
     process.env.NODE_ENV || 'development',
 
-  dbPath:
-    process.env.DB_PATH || './data/admin.sqlite',
-
   jwtSecret:
-    process.env.JWT_SECRET || 'change-me',
+    process.env.JWT_SECRET || 'change-me-before-production',
 
   jwtExpiresIn:
     process.env.JWT_EXPIRES_IN || '1d',
@@ -24,6 +21,6 @@ export const env = {
   supabaseUrl:
     process.env.SUPABASE_URL,
 
-  supabasePublishableKey:
-   process.env.SUPABASE_PUBLISHABLE_KEY,
+  // Server-only key. Prefer a Supabase secret key; legacy service-role keys are also supported.
+  supabaseServerKey: process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY,
 };

@@ -1,7 +1,9 @@
 import { app } from './app.js';
 import { env } from './config/env.js';
-import './db/index.js';
 
-app.listen(env.port, () => {
-  console.log(`[backtoowner-admin-backend] listening on http://localhost:${env.port}`);
+
+const PORT = process.env.PORT || 5001;
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });

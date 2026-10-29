@@ -1,10 +1,12 @@
 
 import { supabase } from '../../config/supabase.js';
 import { supabaseAuth } from '../../config/supabase-auth.js';
+import { env } from '../../config/env.js';
+import { createClient } from '@supabase/supabase-js';
 import { ApiError } from '../../utils/ApiError.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
 
-function publicUser(user, profile = {}) {
+function publicUser(user, profile = {}, counts = {}) {
   const firstName = profile.first_name || '';
   const lastName = profile.last_name || '';
 
@@ -23,12 +25,50 @@ function publicUser(user, profile = {}) {
     phone: profile.phone || user.phone || null,
     avatar: profile.avatar_url || null,
     role: profile.role || 'user',
-    itemsReported: 0,
-    itemsFound: 0,
-    itemsReturned: 0,
+    itemsReported: counts.itemsReported ?? 0,
+    itemsFound: counts.itemsFound ?? 0,
+    itemsReturned: counts.itemsReturned ?? 0,
     trustScore: 95,
     emailVerified: Boolean(user.email_confirmed_at || user.confirmed_at),
     joinedAt: user.created_at || null,
+  };
+}
+
+
+async function getUserReportCounts(userId) {
+  const [lost, found, returned] = await Promise.all([
+    supabase.from('reports')
+      .select('id', { count: 'exact', head: true })
+      .eq('owner_user_id', userId)
+      .eq('type', 'lost')
+      .is('deleted_at', null),
+
+    supabase.from('reports')
+      .select('id', { count: 'exact', head: true })
+      .eq('owner_user_id', userId)
+      .eq('type', 'found')
+      .is('deleted_at', null),
+
+    supabase.from('reports')
+      .select('id', { count: 'exact', head: true })
+      .eq('owner_user_id', userId)
+      .eq('status', 'closed')
+      .is('deleted_at', null),
+  ]);
+
+  const failed = [lost, found, returned].find((result) => result.error);
+  if (failed) {
+    console.error('Mobile profile report counts failed:', {
+      code: failed.error.code,
+      message: failed.error.message,
+    });
+    throw new ApiError(500, 'Could not load profile report counts');
+  }
+
+  return {
+    itemsReported: lost.count ?? 0,
+    itemsFound: found.count ?? 0,
+    itemsReturned: returned.count ?? 0,
   };
 }
 
@@ -155,7 +195,7 @@ export const mobileRegister = asyncHandler(async (req, res) => {
     data: {
       accessToken: data.session.access_token,
       refreshToken: data.session.refresh_token,
-      user: publicUser(data.user, profile),
+      user: publicUser(data.user, profile, await getUserReportCounts(data.user.id)),
     },
   });
 });
@@ -205,7 +245,7 @@ export const mobileLogin = asyncHandler(async (req, res) => {
     data: {
       accessToken: data.session.access_token,
       refreshToken: data.session.refresh_token,
-      user: publicUser(data.user, savedProfile),
+      user: publicUser(data.user, savedProfile, await getUserReportCounts(data.user.id)),
     },
   });
 });
@@ -244,9 +284,253 @@ export const mobileMe = asyncHandler(async (req, res) => {
   res.json({
     success: true,
     data: {
-      user: publicUser(user, profile || {}),
+      user: publicUser(user, profile || {}, await getUserReportCounts(user.id)),
     },
   });
+});
+
+
+export const updateMobileProfile = asyncHandler(async (req, res) => {
+  const user = req.mobileUser;
+  const body = req.body || {};
+
+  const supplied = ['firstName', 'lastName', 'phone', 'email']
+    .filter((key) => Object.prototype.hasOwnProperty.call(body, key));
+
+  if (supplied.length === 0) {
+    throw new ApiError(400, 'Provide at least one profile field to update.');
+  }
+
+  if (body.email !== undefined) {
+    const email = String(body.email).trim().toLowerCase();
+    if (email !== String(user.email || '').toLowerCase()) {
+      throw new ApiError(
+        400,
+        'Email changes require a separate email-confirmation flow.',
+      );
+    }
+  }
+
+  const { data: existing, error: lookupError } = await supabase
+    .from('profiles')
+    .select('*')
+    .eq('id', user.id)
+    .maybeSingle();
+
+  if (lookupError) {
+    console.error('Mobile profile lookup failed:', lookupError.message);
+    throw new ApiError(500, 'Could not load your profile.');
+  }
+
+  let profile = existing;
+
+  if (!profile) {
+    profile = await saveProfile(user, {
+      firstName: user.user_metadata?.first_name || '',
+      lastName: user.user_metadata?.last_name || '',
+      phone: user.user_metadata?.phone || user.phone || '',
+    });
+  }
+
+  const updates = { updated_at: new Date().toISOString() };
+
+  if (body.firstName !== undefined) {
+    updates.first_name = String(body.firstName).trim();
+  }
+  if (body.lastName !== undefined) {
+    updates.last_name = String(body.lastName).trim();
+  }
+  if (body.phone !== undefined) {
+    updates.phone = String(body.phone).trim() || null;
+  }
+
+  if (body.firstName !== undefined || body.lastName !== undefined) {
+    const firstName = updates.first_name ?? profile.first_name ?? '';
+    const lastName = updates.last_name ?? profile.last_name ?? '';
+    updates.display_name = [firstName, lastName].filter(Boolean).join(' ');
+  }
+
+  const { data: saved, error: updateError } = await supabase
+    .from('profiles')
+    .update(updates)
+    .eq('id', user.id)
+    .select('*')
+    .single();
+
+  if (updateError) {
+    console.error('Mobile profile update failed:', {
+      code: updateError.code,
+      message: updateError.message,
+    });
+    throw new ApiError(500, 'Could not save your profile.');
+  }
+
+  res.json({
+    success: true,
+    data: {
+      user: publicUser(user, saved, await getUserReportCounts(user.id)),
+    },
+  });
+});
+
+export const uploadMobileAvatar = asyncHandler(async (req, res) => {
+  const user = req.mobileUser;
+  const file = req.file;
+
+  if (!file) {
+    throw new ApiError(400, 'Please select an image to upload.');
+  }
+
+  const extensions = {
+    'image/jpeg': 'jpg',
+    'image/png': 'png',
+    'image/webp': 'webp',
+  };
+  const extension = extensions[file.mimetype];
+
+  if (!extension) {
+    throw new ApiError(400, 'Only JPEG, PNG, and WebP images are supported.');
+  }
+
+  const bucket = 'profile-avatars';
+  const objectPath = `${user.id}/${Date.now()}.${extension}`;
+
+  const { error: uploadError } = await supabase.storage
+    .from(bucket)
+    .upload(objectPath, file.buffer, {
+      contentType: file.mimetype,
+      upsert: false,
+    });
+
+  if (uploadError) {
+    console.error('Mobile avatar upload failed:', {
+      message: uploadError.message,
+      name: uploadError.name,
+    });
+    throw new ApiError(
+      500,
+      'Could not upload profile image. Check that the profile-avatars storage bucket exists and allows this upload.',
+    );
+  }
+
+  const { data: urlData } = supabase.storage
+    .from(bucket)
+    .getPublicUrl(objectPath);
+
+  const avatarUrl = urlData?.publicUrl;
+  if (!avatarUrl) {
+    await supabase.storage.from(bucket).remove([objectPath]);
+    throw new ApiError(500, 'Could not create profile image URL.');
+  }
+
+  const { data: existing, error: lookupError } = await supabase
+    .from('profiles')
+    .select('*')
+    .eq('id', user.id)
+    .maybeSingle();
+
+  if (lookupError) {
+    await supabase.storage.from(bucket).remove([objectPath]);
+    console.error('Mobile avatar profile lookup failed:', lookupError.message);
+    throw new ApiError(500, 'Could not load your profile.');
+  }
+
+  if (!existing) {
+    try {
+      await saveProfile(user, {
+        firstName: user.user_metadata?.first_name || '',
+        lastName: user.user_metadata?.last_name || '',
+        phone: user.user_metadata?.phone || user.phone || '',
+      });
+    } catch (error) {
+      await supabase.storage.from(bucket).remove([objectPath]);
+      throw error;
+    }
+  }
+
+  const { data: saved, error: updateError } = await supabase
+    .from('profiles')
+    .update({
+      avatar_url: avatarUrl,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', user.id)
+    .select('*')
+    .single();
+
+  if (updateError) {
+    await supabase.storage.from(bucket).remove([objectPath]);
+    console.error('Mobile avatar profile update failed:', {
+      code: updateError.code,
+      message: updateError.message,
+    });
+    throw new ApiError(500, 'Image uploaded, but your profile could not be updated.');
+  }
+
+  res.json({
+    success: true,
+    data: {
+      user: publicUser(user, saved, await getUserReportCounts(user.id)),
+    },
+  });
+});
+
+
+export const changeMobilePassword = asyncHandler(async (req, res) => {
+  const user = req.mobileUser;
+  const currentPassword = req.body?.currentPassword;
+  const newPassword = req.body?.newPassword;
+
+  if (typeof currentPassword !== 'string' || !currentPassword ||
+      typeof newPassword !== 'string' || !newPassword) {
+    throw new ApiError(400, 'Current password and new password are required.');
+  }
+
+  if (newPassword.length < 8) {
+    throw new ApiError(400, 'New password must be at least 8 characters.');
+  }
+
+  if (currentPassword === newPassword) {
+    throw new ApiError(400, 'New password must differ from the current password.');
+  }
+
+  const email = String(user.email || '').trim().toLowerCase();
+  if (!email) {
+    throw new ApiError(400, 'Your account has no email address for password verification.');
+  }
+
+  const verificationClient = createClient(env.supabaseUrl, env.supabaseServerKey, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+    },
+  });
+
+  const { data: verified, error: verifyError } =
+    await verificationClient.auth.signInWithPassword({
+      email,
+      password: currentPassword,
+    });
+
+  if (verifyError || !verified.user || verified.user.id !== user.id) {
+    throw new ApiError(401, 'Current password is incorrect.');
+  }
+
+  const { error: updateError } = await supabaseAuth.auth.admin.updateUserById(
+    user.id,
+    { password: newPassword },
+  );
+
+  if (updateError) {
+    console.error('Mobile password update failed:', {
+      message: updateError.message,
+      status: updateError.status,
+    });
+    throw new ApiError(400, 'Could not update your password. Please check the new password and try again.');
+  }
+
+  res.json({ success: true, data: { message: 'Password updated successfully.' } });
 });
 
 export const mobileRefresh = asyncHandler(async (req, res) => {
@@ -286,7 +570,7 @@ export const mobileRefresh = asyncHandler(async (req, res) => {
     data: {
       accessToken: data.session.access_token,
       refreshToken: data.session.refresh_token,
-      user: publicUser(data.user, profile || {}),
+      user: publicUser(data.user, profile || {}, await getUserReportCounts(data.user.id)),
     },
   });
 });
@@ -444,7 +728,7 @@ export const mobileConfirmEmail = asyncHandler(async (req, res) => {
     data: {
       accessToken,
       refreshToken,
-      user: publicUser(user, profile),
+      user: publicUser(user, profile, await getUserReportCounts(user.id)),
     },
   });
 });
